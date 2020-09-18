@@ -15,8 +15,18 @@
             <pattern>${logPattern}</pattern>
         </encoder>
     </appender>
+    <!-- trace debug日志 -->
+    <appender name="INFO" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <charset>${charset}</charset>
+            <pattern>${logPattern}</pattern>
+        </encoder>
+    </appender>
     
-    <root level="info">
+    <root level="ERROR">
         <appender-ref ref="STDOUT" />
     </root>
+    <logger name="org.apache.beam.sdk.io.kafka.KafkaIO" level="ERROR" additivity="false">
+        <appender-ref ref="STDOUT" />
+    </logger>
 </configuration> 

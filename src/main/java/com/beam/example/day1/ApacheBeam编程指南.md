@@ -2891,3 +2891,9 @@ Repeatedly.forever(AfterFirst.of(
       AfterPane.elementCountAtLeast(100),
       AfterProcessingTime.pastFirstElementInPane().plusDelayOf(Duration.standardMinutes(1))))
 ```
+## 10. 指标
+在Beam模型中，指标可以提供一些关于用户管道当前状态的洞察，可能在管道运行时。可能有不同的原因，例如：
+- 检查在管道中运行特定步骤时遇到的错误数；
+- 监控对后端服务的RPC数量；
+- 检索已处理的元素数量的准确计数；
+- ...等等。
