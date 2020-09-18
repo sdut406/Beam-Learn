@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration scan="true" scanPeriod="60 seconds" debug="false">
+    <!-- 项目名称 -->
+    <property name="appName" value="logBackDemo"/>
+    <!-- 日志格式 -->
+    <property name="charset" value="UTF-8"/>
+    <!-- 格式化输出语句 -->
+    <!--<property name="logPattern" value="[%d{yyyy-MM-dd HH:mm:ss.SSS}][%-5p] [%t] [%c{1}:%M %L] %m %n"/>-->
+    <property name="logPattern" value="[%d{yyyy-MM-dd HH:mm:ss.SSS}][%-5p] [%t] [%c{1}:%M %L] %m %n"/>
+    
+    <!-- 控制台打印配置 -->
+    <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <charset>${charset}</charset>
+            <pattern>${logPattern}</pattern>
+        </encoder>
+    </appender>
+    
+    <root level="info">
+        <appender-ref ref="STDOUT" />
+    </root>
+</configuration> 
