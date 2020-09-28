@@ -31,10 +31,15 @@ public class DemoTrigger {
                     public Instant apply(KV<String, String> input) {
                         return new Instant(TIME_NOW + Integer.parseInt(input.getValue()));
                     }
+                }).withWatermarkFn(new SerializableFunction<KV<String, String>, Instant>() {
+                    @Override
+                    public Instant apply(KV<String, String> input) {
+                        return null;
+                    }
                 });
-        pipeline.apply(readKafka.withoutMetadata()).apply(Window.into(FixedWindows.of(Duration.standardSeconds(3)))
+        /*pipeline.apply(readKafka.withoutMetadata()).apply(Window.into(FixedWindows.of(Duration.standardSeconds(3)))
                 .withAllowedLateness(Duration.standardSeconds(5)).discardingFiredPanes()
-                .triggering(AfterWatermark.pastEndOfWindow().withLateFirings()))
+                .triggering(AfterWatermark.pastEndOfWindow().withLateFirings()))*/
         
     }
 }

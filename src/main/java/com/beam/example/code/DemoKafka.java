@@ -5,6 +5,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 import java.util.stream.StreamSupport;
 
+import org.apache.beam.repackaged.beam_sdks_java_core.org.apache.commons.lang3.time.DateFormatUtils;
+import org.apache.beam.repackaged.beam_sdks_java_core.org.apache.commons.lang3.time.DateUtils;
 import org.apache.beam.sdk.Pipeline;
 import org.apache.beam.sdk.io.kafka.KafkaIO;
 import org.apache.beam.sdk.options.PipelineOptions;
@@ -40,19 +42,19 @@ public class DemoKafka {
         Pipeline pipeline = Pipeline.create(options);
         KafkaIO.Read<String, String> readKafka = KafkaIO.<String, String>read().withBootstrapServers("127.0.0.1:9092").withTopic("BeamTest")
                 .withKeyDeserializer(StringDeserializer.class)
-                .withValueDeserializer(StringDeserializer.class)
-                .withTimestampFn(new SerializableFunction<KV<String, String>, Instant>() {
+                .withValueDeserializer(StringDeserializer.class);
+               /* .withTimestampFn(new SerializableFunction<KV<String, String>, Instant>() {
                     @Override
                     public Instant apply(KV<String, String> input) {
                         return new Instant(TIME_NOW + Integer.parseInt(input.getValue()));
                     }
-                });
+                }*/
         PCollection<String> strPc = pipeline.apply(readKafka.withoutMetadata())
                 .apply(Values.create())
                 .apply(ParDo.of(new DoFn<String, String>() {
                     @ProcessElement
                     public void processElement(@Element String s, OutputReceiver<String> out, ProcessContext context) {
-                        System.out.println(s + (context.timestamp().getMillis() - TIME_NOW)/1000 + "");
+                        System.out.println(s + "->" + DateFormatUtils.format(context.timestamp().getMillis(),"yyyy-MM-dd HH:mm:ss"));
                         out.output(s);
                     }
                 }));
