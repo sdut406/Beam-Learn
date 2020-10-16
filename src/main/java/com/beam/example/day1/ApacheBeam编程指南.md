@@ -2891,9 +2891,572 @@ Repeatedly.forever(AfterFirst.of(
       AfterPane.elementCountAtLeast(100),
       AfterProcessingTime.pastFirstElementInPane().plusDelayOf(Duration.standardMinutes(1))))
 ```
-## 10. 指标
+## 10. 监控指标
 在Beam模型中，指标可以提供一些关于用户管道当前状态的洞察，可能在管道运行时。可能有不同的原因，例如：
 - 检查在管道中运行特定步骤时遇到的错误数；
 - 监控对后端服务的RPC数量；
 - 检索已处理的元素数量的准确计数；
 - ...等等。
+
+### 10.1 Beam 指标的主要概念
+
+- 名称。每个指标都有一个名称，该名称由名称空间和实际名称组成。命名空间可用于区分具有相同名称的多个度量，还可以查询特定命名空间中的所有指标。
+- 范围。每个指标都针对管道中的特定步骤进行报告，以指示在指标增加时运行的代码。
+- 动态创建。指标可以在运行时创建，而无需预先声明它们，就像创建记录器一样。这使在实用程序代码中生成指标并对其进行有用的报告变得更容易。
+- 优雅的降级。如果运行程序不支持报告指标的某些部分，则回退行为是删除指标在更新，而不是使管道失败。如果运行程序不支持某些查询指标，则运行程序不会返回相关数据。
+
+报告的指标隐式地限定在报告它们的管道内的转换中。这允许在多个位置报告相同的指标名称，并标识每个转换报告的值，以及在整个管道中汇总指标。
+    
+    注意：指标是否可在管道执行期间或仅在作业完成后才能访问，取决于运行程序
+    
+### 10.2 指标类型
+目前支持三种类型的指标：`Counter`，`Distribution`和 `Gauge`。
+
+`Counter`（计数器）：一种报告单个长值并且可以递增或者递减的标准
+```java
+Counter counter = Metrics.counter( "namespace", "counter1");
+
+@ProcessElement
+public void processElement(ProcessContext context) {
+  // count the elements
+  counter.inc();
+  ...
+}
+```
+`Distribution`（分布）：报告有关报告值分布信息的指标
+```java
+Distribution distribution = Metrics.distribution( "namespace", "distribution1");
+
+@ProcessElement
+public void processElement(ProcessContext context) {
+  Integer element = context.element();
+    // create a distribution (histogram) of the values
+    distribution.update(element);
+    ...
+}
+```
+`Gauge`（量表）：一种报告报告值中最新值的指标。由于指标是从许多任务中那里收集的，因此该值可能不是绝对的最后值，而是最新的值之一。
+
+```java
+Gauge gauge = Metrics.gauge( "namespace", "gauge1");
+
+@ProcessElement
+public void processElement(ProcessContext context) {
+  Integer element = context.element();
+  // create a gauge (latest value received) of the values
+  gauge.set(element);
+  ...
+}
+```
+### 10.3 查询指标
+`PipelineResult`有一个方法`metrics()`，该方法返回`MetricResults`允许访问指标的对象。`MetricResults`中提供的主要方法允许查询与给定过滤器匹配的所有指标。
+```java
+public interface PipelineResult {
+  MetricResults metrics();
+}
+
+public abstract class MetricResults {
+  public abstract MetricQueryResults queryMetrics(@Nullable MetricsFilter filter);
+}
+
+public interface MetricQueryResults {
+  Iterable<MetricResult<Long>> getCounters();
+  Iterable<MetricResult<DistributionResult>> getDistributions();
+  Iterable<MetricResult<GaugeResult>> getGauges();
+}
+
+public interface MetricResult<T> {
+  MetricName getName();
+  String getStep();
+  T getCommitted();
+  T getAttempted();
+}
+```
+### 10.4 在管道中使用指标
+下面是一个简单的示例，说明如何在用户管道中使用`Counter`指标。
+```java
+// creating a pipeline with custom metrics DoFn
+pipeline
+    .apply(...)
+    .apply(ParDo.of(new MyMetricsDoFn()));
+
+pipelineResult = pipeline.run().waitUntilFinish(...);
+
+// request the metric called "counter1" in namespace called "namespace"
+MetricQueryResults metrics =
+    pipelineResult
+        .metrics()
+        .queryMetrics(
+            MetricsFilter.builder()
+                .addNameFilter(MetricNameFilter.named("namespace", "counter1"))
+                .build());
+
+// print the metric value - there should be only one line because there is only one metric
+// called "counter1" in the namespace called "namespace"
+for (MetricResult<Long> counter: metrics.getCounters()) {
+  System.out.println(counter.getName() + ":" + counter.getAttempted());
+}
+
+public class MyMetricsDoFn extends DoFn<Integer, Integer> {
+  private final Counter counter = Metrics.counter( "namespace", "counter1");
+
+  @ProcessElement
+  public void processElement(ProcessContext context) {
+    // count the elements
+    counter.inc();
+    context.output(context.element());
+  }
+}
+```
+### 10.5 导出指标
+Beam的指标可以导出到外部sink，如果在配置中设置了指标接收器，运行器将在默认5秒周期向它推送指标，该配置保存在[MetricsOptions](https://beam.apache.org/releases/javadoc/2.19.0/org/apache/beam/sdk/metrics/MetricsOptions.html) 类中，它包含推送周期配置，也包含特定选项，如类型和URL。目前仅支持REST HTTP和Graphite sink，仅支持Flink和SparkRunner指标导出。
+
+此外，Beam指标也被导出到内部Spark和Flink仪表盘中，供在各自的UI中参考。
+
+## 11. 状态和计时器
+Beam窗口和触发工具为根据时间戳对无界输入数据进行分组和聚合提供了强大的抽象。然而，有些聚合用例开发人员可能需要比窗口和触发器提供的更高程度的控制。Beam提供了一个API，用于手动管理每个键的健康状态，从而可以对聚合进行细粒度控制。
+
+Beam的状态API对每个键的状态进行建模。要使用状态API，首先使用带有键值对的`PCollection`，在Java中，该`PCollection`被建模为`PCollection<KV, V>>`。处理这个`PCollection`的`ParDo`现在可以声明状态变量。`ParDo`内部，这些状态变量可用于写入或更新当前键的状态，或读取之前为该键写入的状态。状态始终只对当前处理键进行完全作用域。
+
+窗口仍然可以与状态处理一起使用。键的所有状态都限定在当前窗口。这意味着，在第一次看到给定窗口的键时，任何读取的状态都将返回空，并且当窗口完成时，运行程序可以垃圾收集状态。在有状态操作符之前使用`Beam`开窗聚合通常也很有用。例如，使用合并器对数据进行预聚合，然后将聚合后的数据存储在状态内部。使用状态和计时器时，当前不支持合并窗口。
+
+有时，有状态处理用于`DoFn`内部实现状态机样式的处理。在执行此操作时，必须注意记住输入`PCollection`中的元素没有保证顺序，并确保程序逻辑对此有弹性。使用`DirectRunner`编写的单元测试将重排元素处理的顺序，建议测试其正确性。
+
+在Java `DoFn`中，通过创建代表每个状态的最终`StateSpec`成员变量来声明要访问的状态。每个状态都必须使用`StateId`注释来命名；这个名称对于图中的`ParDo`是唯一的，并且与图中的其他节点没有关系。`DoFn`可以声明多个状态变量。
+
+在Python中，`DoFn`通过创建代表每个状态的`StateSpec`类成员变量来声明要访问的状态。每个`StateSpec`都用一个名称初始化，这个名称对于图中的`ParDo`是唯一的，并且与图中的其他节点没有关系。`DoFn`可以声明多个状态变量。
+
+### 11.1 状态类型
+Beam提供了几种状态：
+#### 值状态：ValueState
+`ValueState`是一个标量状态值。对于输入中的每个键，`ValueState`将存储一个类型化的值，可以在`DoFn`的`@ProcessElement`或`@OnTimer`方法中读取和修改。如果`ValueState`的类型注册了编码器，那么`Beam`会自动推断该编码器的状态值。否则，可以在创建`ValueState`时显式指定编码器。例如，下面的`ParDo`创建一个单一状态变量，该变量累积了所看到元素的数量。
+
+```java
+PCollection<KV<String, ValueT>> perUser = readPerUser();
+perUser.apply(ParDo.of(new DoFn<KV<String, ValueT>, OutputT>() {
+  @StateId("state") private final StateSpec<ValueState<Integer>> numElements = StateSpecs.value();
+
+  @ProcessElement public void process(@StateId("state") ValueState<Integer> state) {
+    // Read the number element seen so far for this user key.
+    // state.read() returns null if it was never set. The below code allows us to have a default value of 0.
+    int currentValue = MoreObjects.firstNonNull(state.read(), 0);
+    // Update the state.
+    state.write(currentValue + 1);
+  }
+}));
+```
+Beam还允许显式指定ValueState值的编码器。例如：
+```java
+PCollection<KV<String, ValueT>> perUser = readPerUser();
+perUser.apply(ParDo.of(new DoFn<KV<String, ValueT>, OutputT>() {
+  @StateId("state") private final StateSpec<ValueState<MyType>> numElements = StateSpecs.value(new MyTypeCoder());
+                 ...
+}));
+```
+#### 合并状态：CombiningState
+`CombiningState`允许您创建一个使用`Beam合并器`更新的状态对象。例如，可以重写以前的`ValueState`示例，以使用`CombiningState`
+```java
+PCollection<KV<String, ValueT>> perUser = readPerUser();
+perUser.apply(ParDo.of(new DoFn<KV<String, ValueT>, OutputT>() {
+  @StateId("state") private final StateSpec<CombiningState<Integer, int[], Integer>> numElements =
+      StateSpecs.combining(Sum.ofIntegers());
+
+  @ProcessElement public void process(@StateId("state") ValueState<Integer> state) {
+    state.add(1);
+  }
+}));
+```
+
+#### 包状态：BagState
+状态的一个常见用法是累积多个元素。`BagState`允许累积一组无序元素集。这允许向集合中添加元素，而不需要首先读取整个集合，这样可以提高效率。此外，支持分页读取的运行程序可以允许单个包大于可用内存。
+```java
+PCollection<KV<String, ValueT>> perUser = readPerUser();
+perUser.apply(ParDo.of(new DoFn<KV<String, ValueT>, OutputT>() {
+  @StateId("state") private final StateSpec<BagState<ValueT>> numElements = StateSpecs.bag();
+
+  @ProcessElement public void process(
+    @Element KV<String, ValueT> element,
+    @StateId("state") BagState<ValueT> state) {
+    // Add the current element to the bag for this key.
+    state.add(element.getValue());
+    if (shouldFetch()) {
+      // Occasionally we fetch and process the values.
+      Iterable<ValueT> values = state.read();
+      processValues(values);
+      state.clear();  // Clear the state for this key.
+    }
+  }
+}));
+```
+
+### 11.2 延迟状态读取
+当`DoFn`包含多个状态规范时，按顺序读取每个状态规范可能会很慢。对状态调用`read()`函数可能导致运行程序执行阻塞读取。依次执行多个块读取会增加元素处理延迟。如果知道状态总是被读取，则可以将其注释为`@AlwaysFetched`，然后运行程序可以预取所有必要的状态。例如：
+```java
+PCollection<KV<String, ValueT>> perUser = readPerUser();
+perUser.apply(ParDo.of(new DoFn<KV<String, ValueT>, OutputT>() {
+   @StateId("state1") private final StateSpec<ValueState<Integer>> state1 = StateSpecs.value();
+   @StateId("state2") private final StateSpec<ValueState<String>> state2 = StateSpecs.value();
+   @StateId("state3") private final StateSpec<BagState<ValueT>> state3 = StateSpecs.bag();
+
+  @ProcessElement public void process(
+    @AlwaysFetched @StateId("state1") ValueState<Integer> state1,
+    @AlwaysFetched @StateId("state2") ValueState<String> state2,
+    @AlwaysFetched @StateId("state3") BagState<ValueT> state3) {
+    state1.read();
+    state2.read();
+    state3.read();
+  }
+}));
+```
+但是，如果有些代码路径没有读取状态，则使用`@AlwaysFetched`注释会增加这些路径不必要的读取。在这种情况下，`readLater`方法允许运行程序知道将来会读取状态，从而允许将多个状态读取批量在一起。
+```java
+PCollection<KV<String, ValueT>> perUser = readPerUser();
+perUser.apply(ParDo.of(new DoFn<KV<String, ValueT>, OutputT>() {
+  @StateId("state1") private final StateSpec<ValueState<Integer>> state1 = StateSpecs.value();
+  @StateId("state2") private final StateSpec<ValueState<String>> state2 = StateSpecs.value();
+  @StateId("state3") private final StateSpec<BagState<ValueT>> state3 = StateSpecs.bag();
+
+  @ProcessElement public void process(
+    @StateId("state1") ValueState<Integer> state1,
+    @StateId("state2") ValueState<String> state2,
+    @StateId("state3") BagState<ValueT> state3) {
+    if (/* should read state */) {
+      state1.readLater();
+      state2.readLater();
+      state3.readLater();
+    }
+
+    // The runner can now batch all three states into a single read, reducing latency.
+    processState1(state1.read());
+    processState2(state2.read());
+    processState3(state3.read());
+  }
+}));
+```
+### 11.3 计时器
+`Beam`提供按键计时器回调API。这允许延迟处理使用`stateAPI`存储的数据。计时器可以设置为事件时间或处理时间时间戳的回调。每个定时器都用`TimerId`标识。给定的键计时器只能设置为单个时间戳。计时器上的调用设置将覆盖该键计时器以前的触发时间。
+
+#### 11.3.1 事件时间计时器
+当`DoFn`的输入水印经过计时器设置的时间时，事件计时器触发，这意味着运行程序认为在计时器时间戳之前没有更多元素要处理。这允许事件时间聚合。
+```java
+PCollection<KV<String, ValueT>> perUser = readPerUser();
+perUser.apply(ParDo.of(new DoFn<KV<String, ValueT>, OutputT>() {
+  @StateId("state") private final StateSpec<ValueState<Integer>> state = StateSpecs.value();
+  @TimerId("timer") private final TimerSpec timer = TimerSpecs.timer(TimeDomain.EVENT_TIME);
+
+  @ProcessElement public void process(
+      @Element KV<String, ValueT> element,
+      @Timestamp Instant elementTs,
+      @StateId("state") ValueState<Integer> state,
+      @TimerId("timer") Timer timer) {
+     ...
+     // Set an event-time timer to the element timestamp.
+     timer.set(elementTs);
+  }
+
+   @OnTimer("timer") public void onTimer() {
+      //Process timer.
+   }
+}));
+```
+#### 11.3.2 处理时间计时器
+处理时间计时器在实际挂钟时间过后触发。这通常用于在处理前创建较大批数据。它还可用于安排应在特定时间发生的事件。就像事件时间计时器一样，处理时间计时器是每个键的，每个键都有一个单独的计时器副本。
+
+虽然处理时间计时器可以设置为绝对时间戳，但通常将其设置为相对于当前时间的偏移量。在Java中，可以使用`Timer.offset`和`Timer.setRelative`方法来完成此任务。
+```java
+PCollection<KV<String, ValueT>> perUser = readPerUser();
+perUser.apply(ParDo.of(new DoFn<KV<String, ValueT>, OutputT>() {
+  @TimerId("timer") private final TimerSpec timer = TimerSpecs.timer(TimeDomain.PROCESSING_TIME);
+
+  @ProcessElement public void process(@TimerId("timer") Timer timer) {
+     ...
+     // Set a timer to go off 30 seconds in the future.
+     timer.offset(Duration.standardSeconds(30)).setRelative();
+  }
+
+   @OnTimer("timer") public void onTimer() {
+      //Process timer.
+   }
+}));
+```
+#### 11.3.3 动态计时器标签
+Beam还支持通过`TimerMap`动态设置定时器标记。这允许在`DoFn`中设置多个不同的计时器，并且允许动态地选择计时器标记，例如，基于输入元素中的数据。具有特定标记的计时器只能设置为单个时间戳，因此再次设置计时器具有覆盖具有该标记的计时器以前的过期时间的效果。每个`TimerMap`用`timer family id`标识，不同`timer family`中的`Timer`相互独立。
+```java
+PCollection<KV<String, ValueT>> perUser = readPerUser();
+perUser.apply(ParDo.of(new DoFn<KV<String, ValueT>, OutputT>() {
+  @TimerFamily("actionTimers") private final TimerSpec timer =
+    TimerSpecs.timerMap(TimeDomain.EVENT_TIME);
+
+  @ProcessElement public void process(
+      @Element KV<String, ValueT> element,
+      @Timestamp Instant elementTs,
+      @TimerFamily("actionTimers") TimerMap timers) {
+     timers.set(element.getValue().getActionType(), elementTs);
+  }
+
+   @OnTimerFamily("actionTimers") public void onTimer(@TimerId String timerId) {
+     LOG.info("Timer fired with id " + timerId);
+   }
+}));
+```
+
+#### 11.3.4 定时器输出时间戳
+默认情况下，事件时间计时器将`ParDo`的输出水印保持在计时器的时间戳上。这意味着，如果将计时器设置为`12pm`，则流水线图中晚于`12pm`结束的任何加窗聚合或事件时间计时器都不会过期。定时器的时间戳也是定时器回调的默认输出时间戳。这意味着从`onTimer`方法输出的任何元素都将具有与计时器触发的时间戳相等的时间戳。对于处理时间计时器，默认的输出时间戳和水印保持是设置计时器时输入水印的值。
+
+在某些情况下，`DoFn`需要提前输出时间戳，因此也需要保持输出水印到这些时间戳上。例如，考虑以下临时将记录批处理到状态的管道，并设置一个计时器以释放状态。此代码可能显示正确，但无法正常工作。
+```java
+PCollection<KV<String, ValueT>> perUser = readPerUser();
+perUser.apply(ParDo.of(new DoFn<KV<String, ValueT>, OutputT>() {
+  @StateId("elementBag") private final StateSpec<BagState<ValueT>> elementBag = StateSpecs.bag();
+  @StateId("timerSet") private final StateSpec<ValueState<Boolean>> timerSet = StateSpecs.value();
+  @TimerId("outputState") private final TimerSpec timer = TimerSpecs.timer(TimeDomain.PROCESSING_TIME);
+
+  @ProcessElement public void process(
+      @Element KV<String, ValueT> element,
+      @StateId("elementBag") BagState<ValueT> elementBag,
+      @StateId("timerSet") ValueState<Boolean> timerSet,
+      @TimerId("outputState") Timer timer) {
+    // Add the current element to the bag for this key.
+    elementBag.add(element.getValue());
+    if (!MoreObjects.firstNonNull(timerSet.read(), false)) {
+      // If the timer is not current set, then set it to go off in a minute.
+      timer.offset(Duration.standardMinutes(1)).setRelative();
+      timerSet.write(true);
+    }
+  }
+
+  @OnTimer("outputState") public void onTimer(
+      @StateId("elementBag") BagState<ValueT> elementBag,
+      @StateId("timerSet") ValueState<Boolean> timerSet,
+      OutputReceiver<ValueT> output) {
+    for (ValueT bufferedElement : elementBag.read()) {
+      // Output each element.
+      output.outputWithTimestamp(bufferedElement, bufferedElement.timestamp());
+    }
+    elementBag.clear();
+    // Note that the timer has now fired.
+    timerSet.clear();
+  }
+}));
+```
+这个代码的问题是`ParDo`正在缓冲元素，但是没有任何东西阻止水印前进超过这些元素的时间戳，所以所有这些元素都可能作为延迟数据丢弃。为了防止这种情况发生，需要在计时器上设置输出时间戳，以防止水印前进超过最小元素的时间戳。下面的代码演示了这一点。
+```java
+PCollection<KV<String, ValueT>> perUser = readPerUser();
+perUser.apply(ParDo.of(new DoFn<KV<String, ValueT>, OutputT>() {
+  // The bag of elements accumulated.
+  @StateId("elementBag") private final StateSpec<BagState<ValueT>> elementBag = StateSpecs.bag();
+  // The timestamp of the timer set.
+  @StateId("timerTimestamp") private final StateSpec<ValueState<Long>> timerTimestamp = StateSpecs.value();
+  // The minimum timestamp stored in the bag.
+  @StateId("minTimestampInBag") private final StateSpec<CombiningState<Long, long[], Long>>
+     minTimestampInBag = StateSpecs.combining(Min.ofLongs());
+
+  @TimerId("outputState") private final TimerSpec timer = TimerSpecs.timer(TimeDomain.PROCESSING_TIME);
+
+  @ProcessElement public void process(
+      @Element KV<String, ValueT> element,
+      @StateId("elementBag") BagState<ValueT> elementBag,
+      @AlwaysFetched @StateId("timerTimestamp") ValueState<Long> timerTimestamp,
+      @AlwaysFetched @StateId("minTimestampInBag") CombiningState<Long, long[], Long> minTimestamp,
+      @TimerId("outputState") Timer timer) {
+    // Add the current element to the bag for this key.
+    elementBag.add(element.getValue());
+    // Keep track of the minimum element timestamp currently stored in the bag.
+    minTimestamp.add(element.getValue().timestamp());
+
+    // If the timer is already set, then reset it at the same time but with an updated output timestamp (otherwise
+    // we would keep resetting the timer to the future). If there is no timer set, then set one to expire in a minute.
+    Long timerTimestampMs = timerTimestamp.read();
+    Instant timerToSet = (timerTimestamp.isEmpty().read())
+        ? Instant.now().plus(Duration.standardMinutes(1)) : new Instant(timerTimestampMs);
+    // Setting the outputTimestamp to the minimum timestamp in the bag holds the watermark to that timestamp until the
+    // timer fires. This allows outputting all the elements with their timestamp.
+    timer.withOutputTimestamp(minTimestamp.read()).set(timerToSet).
+    timerTimestamp.write(timerToSet.getMillis());
+  }
+
+  @OnTimer("outputState") public void onTimer(
+      @StateId("elementBag") BagState<ValueT> elementBag,
+      @StateId("timerTimestamp") ValueState<Long> timerTimestamp,
+      OutputReceiver<ValueT> output) {
+    for (ValueT bufferedElement : elementBag.read()) {
+      // Output each element.
+      output.outputWithTimestamp(bufferedElement, bufferedElement.timestamp());
+    }
+    // Note that the timer has now fired.
+    timerTimestamp.clear();
+  }
+}));
+```
+
+### 11.4 垃圾回收状态
+每个键的状态需要被垃圾回收，否则状态的大小增加最终可能会对性能产生负面影响。有两种常见的垃圾收集状态策略。
+
+#### 11.4.1 使用窗口进行垃圾回收
+按键的所有状态和计时器都限定在它所在的窗口。这意味着，根据输入元素的时间戳， `ParDo`将根据元素所在的窗口看到不同的状态值。此外，一旦输入水印通过窗口的末端，运行程序应该垃圾收集该窗口的所有状态。（注：如果窗口允许迟到设置为正值，则运行者必须等待水印通过窗口结束加上垃圾收集状态前允许迟到），这可以作为垃圾收集策略。
+
+例如，给定以下情况：
+```java
+PCollection<KV<String, ValueT>> perUser = readPerUser();
+perUser.apply(Window.into(CalendarWindows.days(1)
+   .withTimeZone(DateTimeZone.forID("America/Los_Angeles"))));
+       .apply(ParDo.of(new DoFn<KV<String, ValueT>, OutputT>() {
+           @StateId("state") private final StateSpec<ValueState<Integer>> state = StateSpecs.value();
+                              ...
+           @ProcessElement public void process(@Timestamp Instant ts, @StateId("state") ValueState<Integer> state) {
+              // The state is scoped to a calendar day window. That means that if the input timestamp ts is after
+              // midnight PST, then a new copy of the state will be seen for the next day.
+           }
+         }));
+```
+这个ParDo每天存储状态。一旦管道处理完给定一天的数据，该天的所有状态都将是垃圾收集。
+
+#### 11.4.2 使用定时器进行垃圾回收
+在某些情况下，很难找到一个窗口策略来建模期望的垃圾收集策略。例如，一个常见的情况是，一旦一段时间内在键上没有看到任何活动，就对键的状态进行垃圾回收。这可以通过更新一个用于垃圾收集状态的计时器来实现。例如：
+```java
+PCollection<KV<String, ValueT>> perUser = readPerUser();
+perUser.apply(ParDo.of(new DoFn<KV<String, ValueT>, OutputT>() {
+  // The state for the key.
+  @StateId("state") private final StateSpec<ValueState<ValueT>> state = StateSpecs.value();
+
+  // The maximum element timestamp seen so far.
+  @StateId("maxTimestampSeen") private final StateSpec<CombiningState<Long, long[], Long>>
+     maxTimestamp = StateSpecs.combining(Max.ofLongs());
+
+  @TimerId("gcTimer") private final TimerSpec gcTimer = TimerSpecs.timer(TimeDomain.EVENT_TIME);
+
+  @ProcessElement public void process(
+      @Element KV<String, ValueT> element,
+      @Timestamp Instant ts,
+      @StateId("state") ValueState<ValueT> state,
+      @StateId("maxTimestampSeen") CombiningState<Long, long[], Long> maxTimestamp,
+      @TimerId("gcTimer") gcTimer) {
+    updateState(state, element);
+    maxTimestamp.add(ts.getMillis());
+
+    // Set the timer to be one hour after the maximum timestamp seen. This will keep overwriting the same timer, so
+    // as long as there is activity on this key the state will stay active. Once the key goes inactive for one hour's
+    // worth of event time (as measured by the watermark), then the gc timer will fire.
+    Instant expirationTime = new Instant(maxTimestamp.read()).plus(Duration.standardHours(1));
+    timer.set(expirationTime);
+  }
+
+  @OnTimer("gcTimer") public void onTimer(
+      @StateId("state") ValueState<ValueT> state,
+      @StateId("maxTimestampSeen") CombiningState<Long, long[], Long> maxTimestamp) {
+       // Clear all state for the key.
+       state.clear();
+       maxTimestamp.clear();
+    }
+ }
+```
+### 11.5 状态和计时器示例
+以下是状态和计时器的一些示例用法
+
+#### 11.5.1 加入点击和视图
+在本示例中，管道正在处理来自电子商务网站主页的数据。有两个输入流：视图流，表示在主页上显示给用户的建议产品链接；点击流，表示用户对这些链接的实际点击。流水线的目标是将点击事件与视图事件连接起来，输出包含来自这两个事件的信息的新连接事件。每个链接都有一个唯一的标识符，该标识符存在于视图事件和联接事件中。
+
+许多视图事件将永远不会被单击后继。此管道将等待一小时的点击，之后它将放弃此连接。虽然每个点击事件都应该有一个视图事件，但是一些少量的视图事件可能会丢失，并且永远无法到达Beam管道；管道同样会在看到点击事件后等待一个小时，如果此时视图事件没有到达，则放弃。输入事件没有排序-可以在查看事件之前看到单击事件。一小时的加入超时应基于事件时间，而不是基于处理时间。
+```java
+// Read the event stream and key it by the link id.
+PCollection<KV<String, Event>> eventsPerLinkId =
+    readEvents()
+    .apply(WithKeys.of(Event::getLinkId).withKeyType(TypeDescriptors.strings()));
+
+perUser.apply(ParDo.of(new DoFn<KV<String, Event>, JoinedEvent>() {
+  // Store the view event.
+  @StateId("view") private final StateSpec<ValueState<Event>> viewState = StateSpecs.value();
+  // Store the click event.
+  @StateId("click") private final StateSpec<ValueState<Event>> clickState = StateSpecs.value();
+
+  // The maximum element timestamp seen so far.
+  @StateId("maxTimestampSeen") private final StateSpec<CombiningState<Long, long[], Long>>
+     maxTimestamp = StateSpecs.combining(Max.ofLongs());
+
+  // Timer that fires when an hour goes by with an incomplete join.
+  @TimerId("gcTimer") private final TimerSpec gcTimer = TimerSpecs.timer(TimeDomain.EVENT_TIME);
+
+  @ProcessElement public void process(
+      @Element KV<String, Event> element,
+      @Timestamp Instant ts,
+      @AlwaysFetched @StateId("view") ValueState<Event> viewState,
+      @AlwaysFetched @StateId("click") ValueState<Event> clickState,
+      @AlwaysFetched @StateId("maxTimestampSeen") CombiningState<Long, long[], Long> maxTimestampState,
+      @TimerId("gcTimer") gcTimer,
+      OutputReceiver<JoinedEvent> output) {
+    // Store the event into the correct state variable.
+    Event event = element.getValue();
+    ValueState<Event> valueState = event.getType().equals(VIEW) ? viewState : clickState;
+    valueState.write(event);
+
+    Event view = viewState.read();
+    Event click = clickState.read();
+    (if view != null && click != null) {
+      // We've seen both a view and a click. Output a joined event and clear state.
+      output.output(JoinedEvent.of(view, click));
+      clearState(viewState, clickState, maxTimestampState);
+    } else {
+       // We've only seen on half of the join.
+       // Set the timer to be one hour after the maximum timestamp seen. This will keep overwriting the same timer, so
+       // as long as there is activity on this key the state will stay active. Once the key goes inactive for one hour's
+       // worth of event time (as measured by the watermark), then the gc timer will fire.
+        maxTimestampState.add(ts.getMillis());
+       Instant expirationTime = new Instant(maxTimestampState.read()).plus(Duration.standardHours(1));
+       gcTimer.set(expirationTime);
+    }
+  }
+
+  @OnTimer("gcTimer") public void onTimer(
+      @StateId("view") ValueState<Event> viewState,
+      @StateId("click") ValueState<Event> clickState,
+      @StateId("maxTimestampSeen") CombiningState<Long, long[], Long> maxTimestampState) {
+       // An hour has gone by with an incomplete join. Give up and clear the state.
+       clearState(viewState, clickState, maxTimestampState);
+    }
+
+    private void clearState(
+      @StateId("view") ValueState<Event> viewState,
+      @StateId("click") ValueState<Event> clickState,
+      @StateId("maxTimestampSeen") CombiningState<Long, long[], Long> maxTimestampState) {
+      viewState.clear();
+      clickState.clear();
+      maxTimestampState.clear();
+    }
+ }));
+```
+#### 11.5.2 批处理RPC
+在此示例中，输入元素被转发到外部RPC服务。RPC接受批处理请求-同一个用户的多个事件可以在一个RPC调用中批处理。由于这个RPC服务也施加了速率限制，我们想将十秒的事件一起批处理，以减少调用的数量。
+```java
+PCollection<KV<String, ValueT>> perUser = readPerUser();
+perUser.apply(ParDo.of(new DoFn<KV<String, ValueT>, OutputT>() {
+  // Store the elements buffered so far.
+  @StateId("state") private final StateSpec<BagState<ValueT>> elements = StateSpecs.bag();
+  // Keep track of whether a timer is currently set or not.
+  @StateId("isTimerSet") private final StateSpec<ValueState<Boolean>> isTimerSet = StateSpecs.value();
+  // The processing-time timer user to publish the RPC.
+  @TimerId("outputState") private final TimerSpec timer = TimerSpecs.timer(TimeDomain.PROCESSING_TIME);
+
+  @ProcessElement public void process(
+    @Element KV<String, ValueT> element,
+    @StateId("state") BagState<ValueT> elementsState,
+    @StateId("isTimerSet") ValueState<Boolean> isTimerSetState,
+    @TimerId("outputState") Timer timer) {
+    // Add the current element to the bag for this key.
+    state.add(element.getValue());
+    if (!MoreObjects.firstNonNull(isTimerSetState.read(), false)) {
+      // If there is no timer currently set, then set one to go off in 10 seconds.
+      timer.offset(Duration.standardSeconds(10)).setRelative();
+      isTimerSetState.write(true);
+   }
+  }
+
+  @OnTimer("outputState") public void onTimer(
+    @StateId("state") BagState<ValueT> elementsState,
+    @StateId("isTimerSet") ValueState<Boolean> isTimerSetState) {
+    // Send an RPC containing the batched elements and clear state.
+    sendRPC(elementsState.read());
+    elementsState.clear();
+    isTimerSetState.clear();
+  }
+}));
+```
